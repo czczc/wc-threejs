@@ -32,3 +32,15 @@ This is a web-based application that simulates and visualizes Cherenkov radiatio
     npm run dev
     ```
 5.  **Open Application:** The terminal will output a local URL (usually `http://localhost:5173` or similar). Open this URL in your web browser to view the simulation.
+
+## Building for Production
+
+To create an optimized build suitable for deployment:
+
+1.  Open a terminal in the project's root directory.
+2.  Run the build command:
+    ```bash
+    npm run build
+    ```
+3.  This will create a `dist` directory containing the optimized static assets (HTML, CSS, JavaScript).
+4.  Deploy the contents of the `dist` directory to your web server or hosting platform.
