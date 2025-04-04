@@ -1,0 +1,451 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GUI } from 'dat.gui';
+
+// --- Constants ---
+const WATER_DENSITY = 1000; // kg/m^3
+const DETECTOR_MASS = 30000; // kg (30 tons)
+const WATER_VOLUME = DETECTOR_MASS / WATER_DENSITY; // m^3
+const REFRACTIVE_INDEX = 1.33;
+const MUON_BETA = 0.999; // Speed relative to c (close to 1 for relativistic muons)
+const CHERENKOV_COS_THETA = 1 / (MUON_BETA * REFRACTIVE_INDEX);
+const CHERENKOV_ANGLE = Math.acos(CHERENKOV_COS_THETA); // Radians
+
+const PHOTON_SPEED = (3e8 / REFRACTIVE_INDEX) * 1e-9; // m/ns (scaled for simulation time)
+const PHOTON_LIFETIME = 5000; // Simulation steps before removal if not hit
+const PHOTONS_PER_STEP = 100; // Number of photons to generate per simulation step
+const MUON_STEP_LENGTH = 0.1; // meters per simulation step
+
+const PMT_ROWS = 10;
+const PMTS_PER_ROW = 12;
+const PMT_RADIUS = 0.15; // meters
+
+// --- Scene Setup ---
+let scene, camera, renderer, controls;
+let cylinder, pmtMeshes = [], photonPoints, muonTrackLine;
+let photons = []; // Array to hold photon data { mesh/index, velocity, lifetime }
+let hitPmts = new Map(); // Map<pmtIndex, hitTime>
+
+// --- Simulation State ---
+let muonPosition = new THREE.Vector3();
+let muonDirection = new THREE.Vector3(0, -1, 0); // Initial direction (downwards)
+let isSimulating = false;
+let simulationTime = 0;
+let detectorRadius, detectorHeight;
+let simulationStepAccumulator = 0; // Accumulator for fractional steps
+let maxSimulationTime = 0; // To store the time the simulation ends
+// --- GUI ---
+let gui;
+const simParams = {
+    angleTheta: 0, // degrees (Down=0)
+    anglePhi: 0,   // degrees (Azimuth)
+    runSimulation: startSimulation, // Link button to function
+    simulationSpeed: 0.5 // Steps per animation frame
+};
+
+init();
+animate();
+
+function init() {
+    // Scene
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff); // White background
+
+    // Camera
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(3, 3, 3);
+    camera.lookAt(scene.position);
+
+    // Renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    directionalLight.position.set(5, 10, 7);
+    scene.add(directionalLight);
+
+    // Controls
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    // Detector Geometry
+    calculateDetectorDimensions();
+    createDetectorCylinder();
+    createPmts();
+
+    // Photon Geometry (using Points for efficiency)
+    const photonGeometry = new THREE.BufferGeometry();
+    const photonMaterial = new THREE.PointsMaterial({
+        color: 0x00FFFF, // Cyan color for Cherenkov light
+        size: 0.05,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending, // Looks brighter when overlapping
+        depthWrite: false // Prevent photons obscuring each other unrealistically
+    });
+    photonPoints = new THREE.Points(photonGeometry, photonMaterial);
+    scene.add(photonPoints);
+
+    // Muon Track Line
+    const trackMaterial = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 2 }); // Red track
+    const trackGeometry = new THREE.BufferGeometry(); // Will be updated dynamically
+    muonTrackLine = new THREE.Line(trackGeometry, trackMaterial);
+    scene.add(muonTrackLine);
+
+    // GUI Setup
+    createGUI();
+
+    // Event Listeners
+    window.addEventListener('resize', onWindowResize);
+}
+
+function calculateDetectorDimensions() {
+    // Let's choose a common aspect ratio, Height = 2 * Radius (H=D)
+    // V = pi * R^2 * H = pi * R^2 * (2R) = 2 * pi * R^3
+    // R = cuberoot(V / (2 * pi))
+    detectorRadius = Math.cbrt(WATER_VOLUME / (2 * Math.PI));
+    detectorHeight = 2 * detectorRadius;
+    console.log(`Detector Dimensions: Radius=${detectorRadius.toFixed(2)}m, Height=${detectorHeight.toFixed(2)}m`);
+}
+
+function createDetectorCylinder() {
+    const geometry = new THREE.CylinderGeometry(detectorRadius, detectorRadius, detectorHeight, 32, 1, true); // Open ended for visibility
+    const material = new THREE.MeshStandardMaterial({
+        color: 0x0055aa,
+        transparent: true,
+        opacity: 0.15,
+        side: THREE.DoubleSide, // See inside and outside
+        metalness: 0.1,
+        roughness: 0.5
+    });
+    cylinder = new THREE.Mesh(geometry, material);
+    scene.add(cylinder);
+
+    // Add wireframe for better shape perception
+    const wireframeGeometry = new THREE.WireframeGeometry(geometry);
+    const wireframeMaterial = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.2 });
+    const wireframe = new THREE.LineSegments(wireframeGeometry, wireframeMaterial);
+    cylinder.add(wireframe); // Add wireframe as child
+}
+
+function createPmts() {
+    const pmtGeometry = new THREE.SphereGeometry(PMT_RADIUS, 16, 8); // Simple sphere for PMTs
+    const pmtMaterial = new THREE.MeshBasicMaterial({
+        color: 0x444444, // Default dark color
+        transparent: true,
+        opacity: 0.1, // Make unhit PMTs very faint, almost invisible outline
+        depthWrite: false // Helps with transparency rendering
+    });
+
+    const halfHeight = detectorHeight / 2;
+    const angleStep = (2 * Math.PI) / PMTS_PER_ROW;
+    const heightStep = detectorHeight / (PMT_ROWS + 1);
+
+    pmtMeshes = []; // Clear previous PMTs if any
+
+    // Wall PMTs
+    for (let i = 1; i <= PMT_ROWS; i++) {
+        const y = halfHeight - i * heightStep;
+        for (let j = 0; j < PMTS_PER_ROW; j++) {
+            const angle = j * angleStep;
+            const placementRadius = detectorRadius + PMT_RADIUS; // Place center just outside
+            const x = placementRadius * Math.cos(angle);
+            const z = placementRadius * Math.sin(angle);
+
+            const pmt = new THREE.Mesh(pmtGeometry.clone(), pmtMaterial.clone());
+            pmt.position.set(x, y, z);
+            // Point PMT towards the center (optional, mostly visual)
+            pmt.lookAt(new THREE.Vector3(0, y, 0));
+            scene.add(pmt);
+            pmtMeshes.push(pmt);
+        }
+    }
+
+    // Optional: Add Top/Bottom Cap PMTs (more complex positioning)
+    // ... (Code to add PMTs on top/bottom caps if desired) ...
+
+    console.log(`Created ${pmtMeshes.length} PMTs`);
+}
+function createGUI() {
+    gui = new GUI();
+    gui.add(simParams, 'angleTheta', 0, 90, 1).name('Muon Theta (Down=0)');
+    gui.add(simParams, 'anglePhi', 0, 360, 1).name('Muon Phi (Azimuth)');
+    gui.add(simParams, 'simulationSpeed', 0.1, 2, 0.1).name('Sim Speed (Steps/Frame)');
+    gui.add(simParams, 'runSimulation').name('Run Simulation');
+}
+
+
+
+function startSimulation() {
+    resetSimulation();
+    isSimulating = true;
+    simulationTime = 0;
+
+    // Calculate initial muon state based on UI
+    const theta = THREE.MathUtils.degToRad(simParams.angleTheta); // Angle from +Y axis
+    const phi = THREE.MathUtils.degToRad(simParams.anglePhi);   // Angle around Y axis
+
+    // Convert spherical coordinates (r=1, theta, phi) to Cartesian direction vector
+    // Note: Three.js uses Y-up. Theta=0 is often +Z, but here we define it as +Y (downwards).
+    // Standard physics spherical: x=r*sin(theta)*cos(phi), y=r*cos(theta), z=r*sin(theta)*sin(phi)
+    // Adapting to Y-down (theta=0 is -Y):
+    muonDirection.set(
+        Math.sin(theta) * Math.cos(phi),
+        -Math.cos(theta), // Negative Y for downwards
+        Math.sin(theta) * Math.sin(phi)
+    ).normalize();
+
+    // Start muon at top center
+    muonPosition.set(0, detectorHeight / 2, 0);
+
+    console.log("Starting simulation with direction:", muonDirection);
+    // Initialize muon track line starting point
+    const trackPoints = [muonPosition.clone()];
+    muonTrackLine.geometry.setFromPoints(trackPoints);
+
+}
+
+function resetSimulation() {
+    isSimulating = false;
+
+    // Reset photons
+    photons = [];
+    photonPoints.geometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3)); // Clear geometry
+    photonPoints.geometry.attributes.position.needsUpdate = true;
+
+
+    // Reset PMT colors
+    hitPmts.clear(); // Clear the map
+    maxSimulationTime = 0; // Reset max time
+    const defaultMaterial = new THREE.MeshBasicMaterial({ color: 0x444444 });
+    pmtMeshes.forEach(pmt => {
+        // Ensure material exists and reset color
+        // Reset material properties for unhit state
+        if (!pmt.material) {
+            // If material somehow got removed, recreate it (shouldn't happen often)
+             pmt.material = new THREE.MeshBasicMaterial({
+                color: 0x444444,
+                transparent: true,
+                opacity: 0.1,
+                depthWrite: false
+            });
+        } else {
+            pmt.material.color.set(0x444444);
+            pmt.material.opacity = 0.1; // Reset to faint outline
+            pmt.material.transparent = true;
+            pmt.material.needsUpdate = true; // Important for material changes
+        }
+    });
+
+    // Clear muon track line
+    // More robustly clear the track line geometry
+    const trackGeometry = muonTrackLine.geometry;
+    trackGeometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3)); // Replace attribute with empty one
+    trackGeometry.attributes.position.needsUpdate = true;
+    trackGeometry.computeBoundingSphere(); // Reset bounds
+    trackGeometry.setDrawRange(0, 0); // Explicitly tell renderer to draw zero vertices
+
+    console.log("Simulation reset.");
+}
+
+function generateCherenkovPhotons() {
+    if (!isSimulating) return;
+
+    const muonDir = muonDirection;
+    const emissionPoint = muonPosition;
+
+    for (let i = 0; i < PHOTONS_PER_STEP; i++) {
+        // 1. Generate a random direction perpendicular to muonDir
+        let perpVec;
+        if (Math.abs(muonDir.y) > 0.99) { // Handle case where muon is nearly vertical
+             perpVec = new THREE.Vector3(1, 0, 0);
+        } else {
+             perpVec = new THREE.Vector3(0, 1, 0).cross(muonDir).normalize();
+        }
+
+        // 2. Rotate this perpendicular vector randomly around muonDir
+        const randomAngle = Math.random() * 2 * Math.PI;
+        const axisAngle = new THREE.Quaternion().setFromAxisAngle(muonDir, randomAngle);
+        perpVec.applyQuaternion(axisAngle);
+
+        // 3. Create the photon direction vector
+        // Start with the muon direction, scaled by cos(theta_c)
+        const photonDir = muonDir.clone().multiplyScalar(CHERENKOV_COS_THETA);
+        // Add the perpendicular component, scaled by sin(theta_c)
+        photonDir.add(perpVec.multiplyScalar(Math.sin(CHERENKOV_ANGLE)));
+        photonDir.normalize(); // Ensure it's a unit vector
+
+        // Add photon data
+        photons.push({
+            position: emissionPoint.clone(),
+            velocity: photonDir.multiplyScalar(PHOTON_SPEED), // Scale direction by speed
+            lifetime: PHOTON_LIFETIME
+        });
+    }
+}
+
+function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation step
+    const currentPhotonPositions = [];
+    const nextPhotons = [];
+
+    for (let i = 0; i < photons.length; i++) {
+        const p = photons[i];
+
+        // Update position
+        p.position.addScaledVector(p.velocity, deltaTime); // deltaTime is effectively 1 simulation step here
+        p.lifetime -= 1;
+
+        // Check boundaries & lifetime
+        const withinCylinder =
+            p.position.y >= -detectorHeight / 2 && p.position.y <= detectorHeight / 2 &&
+            (p.position.x * p.position.x + p.position.z * p.position.z) <= detectorRadius * detectorRadius;
+
+        if (p.lifetime <= 0 || !withinCylinder) {
+            continue; // Remove photon
+        }
+
+        // Check for PMT hits (simple distance check)
+        let hit = false;
+        for (let j = 0; j < pmtMeshes.length; j++) {
+            const pmt = pmtMeshes[j];
+            if (p.position.distanceTo(pmt.position) < PMT_RADIUS * 1.5) { // थोड़ा बड़ा त्रिज्या वाला जांच
+                if (!hitPmts.has(j)) { // Only trigger hit once per PMT per simulation
+                     // Record hit time and set intermediate color
+                     hitPmts.set(j, simulationTime);
+                     // Ensure material exists before setting color
+                     // Make PMT opaque and yellow on initial hit
+                     if (!pmt.material) {
+                         // Should not happen if resetSimulation works, but handle defensively
+                         pmt.material = new THREE.MeshBasicMaterial({ color: 0xFFFF00, opacity: 1, transparent: false });
+                     } else {
+                         pmt.material.color.set(0xFFFF00);
+                         pmt.material.opacity = 1; // Make opaque
+                         pmt.material.transparent = false;
+                         pmt.material.needsUpdate = true; // Important for material changes
+                     }
+                }
+                hit = true;
+                break; // Photon is absorbed by the PMT
+            }
+        }
+
+        if (!hit) {
+            currentPhotonPositions.push(p.position.x, p.position.y, p.position.z);
+            nextPhotons.push(p); // Keep photon for next frame
+        }
+    }
+
+    photons = nextPhotons; // Update the live photon list
+
+    // Update Three.js Points geometry
+    photonPoints.geometry.setAttribute('position', new THREE.Float32BufferAttribute(currentPhotonPositions, 3));
+    photonPoints.geometry.attributes.position.needsUpdate = true;
+    photonPoints.geometry.computeBoundingSphere(); // Important for visibility checks
+}
+
+function updateMuon() {
+    if (!isSimulating) return;
+
+    // Move muon
+    muonPosition.addScaledVector(muonDirection, MUON_STEP_LENGTH);
+
+    // Check if muon is still inside
+    const inside = muonPosition.y >= -detectorHeight / 2 - 0.1 && // Add a little buffer
+                   muonPosition.y <= detectorHeight / 2 + 0.1 &&
+                   (muonPosition.x * muonPosition.x + muonPosition.z * muonPosition.z) <= detectorRadius * detectorRadius;
+
+    if (inside) {
+        // Add current position to the track line
+        const points = muonTrackLine.geometry.attributes.position.array;
+        const newPoints = new Float32Array(points.length + 3);
+        newPoints.set(points); // Copy old points
+        newPoints[points.length] = muonPosition.x;
+        newPoints[points.length + 1] = muonPosition.y;
+        newPoints[points.length + 2] = muonPosition.z;
+        const trackGeometry = muonTrackLine.geometry;
+        trackGeometry.setAttribute('position', new THREE.BufferAttribute(newPoints, 3));
+        trackGeometry.attributes.position.needsUpdate = true;
+        // Update draw range to include the new point
+        const pointCount = newPoints.length / 3;
+        trackGeometry.setDrawRange(0, pointCount);
+        muonTrackLine.geometry.computeBoundingSphere();
+
+
+        // Generate photons at the new position
+        generateCherenkovPhotons();
+    } else {
+        isSimulating = false; // Stop simulation when muon exits
+        maxSimulationTime = simulationTime; // Record final time
+        console.log(`Muon exited detector at time ${maxSimulationTime}.`);
+        updatePmtColorsFinal(); // Update colors based on hit times
+    }
+
+    if (isSimulating) { // Only increment time if still simulating
+        simulationTime++;
+    }
+}
+
+// Function to update PMT colors based on linear hit time after simulation ends
+function updatePmtColorsFinal() {
+    if (maxSimulationTime <= 0) return; // Avoid division by zero or no hits
+
+    hitPmts.forEach((hitTime, pmtIndex) => {
+        const pmt = pmtMeshes[pmtIndex];
+        if (pmt && pmt.material) {
+            // Normalize time linearly (0=start, 1=end)
+            const t = Math.min(1, Math.max(0, hitTime / maxSimulationTime));
+
+            // Interpolate between Blue (t=0) and Yellow (t=1)
+            // R = t, G = t, B = 1 - t
+            const color = new THREE.Color().setRGB(t, t, 1 - t);
+
+            pmt.material.color.set(color);
+            pmt.material.opacity = 1; // Ensure it stays opaque
+            pmt.material.transparent = false;
+            pmt.material.needsUpdate = true;
+        }
+    });
+    console.log("Updated final PMT colors based on linear hit time (Blue to Red).");
+}
+
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    controls.update(); // Only required if controls.enableDamping = true
+
+    // Handle simulation steps with fractional speed
+    if (isSimulating) {
+        simulationStepAccumulator += simParams.simulationSpeed;
+        const stepsToRun = Math.floor(simulationStepAccumulator);
+
+        if (stepsToRun > 0) {
+            for (let i = 0; i < stepsToRun; i++) {
+                updateMuon(); // This also generates photons if inside
+                updatePhotons(1); // Pass a fixed time step (e.g., 1)
+                if (!isSimulating) break; // Stop looping if muon exits during steps
+            }
+            simulationStepAccumulator -= stepsToRun; // Subtract the executed steps
+        }
+    } else {
+         // Still update photons even if simulation stopped (e.g., muon exited)
+         // until they fade or hit PMTs
+         if (photons.length > 0) {
+             updatePhotons(1);
+         }
+         simulationStepAccumulator = 0; // Reset accumulator when not simulating
+    }
+
+
+    renderer.render(scene, camera);
+}
