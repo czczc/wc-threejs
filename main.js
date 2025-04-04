@@ -24,7 +24,7 @@ const PMT_RADIUS = 0.15; // meters
 
 // --- Scene Setup ---
 let scene, camera, renderer, controls;
-let cylinder, pmtMeshes = [], photonPoints, muonTrackLine;
+let cylinder, pmtMeshes = [], photonPoints, muonTrackLine, pmtDivs = [];
 let photons = []; // Array to hold photon data { position, velocity, lifetime }
 let raycaster, pointer; // For click detection
 let hitPmts = new Map(); // Map<pmtIndex, { firstHitTime: number, photonCount: number }>
@@ -80,6 +80,7 @@ function init() {
     calculateDetectorDimensions();
     createDetectorCylinder();
     createPmts();
+    create2dDisplay(); // Create the 2D representation
 
     // Photon Geometry (using Points for efficiency)
     // Photon Geometry (using Points for efficiency)
@@ -194,6 +195,40 @@ function createPmts() {
 
     console.log(`Created ${pmtMeshes.length} PMTs`);
 }
+
+function create2dDisplay() {
+    const container = document.getElementById('display-2d');
+    if (!container) {
+        console.error("2D display container not found!");
+        return;
+    }
+    container.innerHTML = ''; // Clear previous content
+    pmtDivs = []; // Reset the divs array
+
+    const pmtSize = Math.min(
+        (container.clientWidth - 10) / PMTS_PER_ROW, // Account for padding/borders
+        (container.clientHeight - 10) / PMT_ROWS
+    ) - 2; // Subtract margin/border
+
+    container.style.setProperty('--pmt-size', `${pmtSize}px`); // Use CSS variable for size
+
+    for (let i = 0; i < PMT_ROWS; i++) {
+        for (let j = 0; j < PMTS_PER_ROW; j++) {
+            const pmtIndex = i * PMTS_PER_ROW + j; // Calculate index based on loops
+            const div = document.createElement('div');
+            div.style.width = `var(--pmt-size)`;
+            div.style.height = `var(--pmt-size)`;
+            div.style.backgroundColor = 'white'; // Default background
+            div.style.border = '1px solid #888';
+            div.style.margin = '1px';
+            div.style.boxSizing = 'border-box';
+            div.title = `PMT Index: ${pmtIndex}`; // Tooltip for info
+            container.appendChild(div);
+            pmtDivs[pmtIndex] = div; // Store reference by index
+        }
+    }
+    console.log(`Created ${pmtDivs.length} 2D PMT divs`);
+}
 function createGUI() {
     gui = new GUI();
     gui.add(simParams, 'angleTheta', 0, 90, 1).name('Muon Theta (Down=0)');
@@ -270,6 +305,13 @@ function resetSimulation() {
             pmt.material.opacity = 0.1; // Reset to faint outline
             pmt.material.transparent = true;
             pmt.material.needsUpdate = true; // Important for material changes
+        }
+    });
+
+    // Reset 2D PMT divs
+    pmtDivs.forEach(div => {
+        if (div) {
+            div.style.backgroundColor = 'white'; // Reset to default background
         }
     });
 
@@ -381,6 +423,11 @@ function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation ste
                         pmt.material.opacity = 1;
                         pmt.material.transparent = false;
                         pmt.material.needsUpdate = true;
+
+                        // Update 2D display
+                        if (pmtDivs[j]) {
+                            pmtDivs[j].style.backgroundColor = color.getStyle(); // Use the calculated color
+                        }
                     }
                 } else { // Subsequent hit for this PMT
                     hitData.photonCount += 1;
