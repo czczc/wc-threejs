@@ -94,7 +94,7 @@ function init() {
     photonGeometry.setDrawRange(0, 0); // Initially draw nothing
 
     const photonMaterial = new THREE.PointsMaterial({
-        color: 0x00FFFF, // Cyan color for Cherenkov light
+        color: 0x00FF00, // Green color for photons
         size: 0.05,
         transparent: true,
         opacity: 0.8,
