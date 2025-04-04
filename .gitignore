@@ -128,3 +128,5 @@ dist
 # Vite build output
 dist/
 .vite/
+
+sync.sh
