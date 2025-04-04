@@ -4,14 +4,19 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cherenkov Radiation Viewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script> <!-- Add Chart.js -->
     <style>
         body { margin: 0; overflow: hidden; }
         canvas { display: block; }
+        #pmt-chart-container { position: absolute; bottom: 10px; left: 10px; width: 300px; height: 200px; background-color: rgba(255, 255, 255, 0.9); border: 1px solid #ccc; z-index: 10; padding: 5px; box-sizing: border-box; }
     </style>
 </head>
 <body>
     <div id="display-2d" style="position: absolute; top: 10px; left: 10px; width: 300px; height: 200px; background-color: white; z-index: 10; padding: 2px 2px 1px 2px; box-sizing: border-box; display: grid; grid-template-columns: repeat(12, 1fr); grid-template-rows: repeat(10, 1fr); gap: 1px; align-content: start;">
         <!-- 2D PMT elements will be added here by JS -->
+    </div>
+    <div id="pmt-chart-container">
+        <canvas id="pmtHitChart"></canvas>
     </div>
     <script type="module" src="main.js"></script>
 </body>

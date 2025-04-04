@@ -12,22 +12,23 @@ const CHERENKOV_COS_THETA = 1 / (MUON_BETA * REFRACTIVE_INDEX);
 const CHERENKOV_ANGLE = Math.acos(CHERENKOV_COS_THETA); // Radians
 
 const PHOTON_SPEED = (3e8 / REFRACTIVE_INDEX) * 1e-9; // m/ns (scaled for simulation time)
-const PHOTON_LIFETIME = 4000; // Simulation steps before removal if not hit
-const PHOTONS_PER_STEP = 100; // Number of photons to generate per simulation step
+const PHOTON_LIFETIME = 400; // Simulation steps before removal if not hit
+const PHOTONS_PER_STEP = 120*0.4; // Number of photons to generate per simulation step
 const MUON_STEP_LENGTH = 0.01; // meters per simulation step
 const MAX_VISIBLE_PHOTONS = 100000; // Maximum photons to buffer/draw at once
 const MAX_TRACK_POINTS = 5000; // Max points for the muon track line buffer
 
 const PMT_ROWS = 10;
 const PMTS_PER_ROW = 12;
-const PMT_RADIUS = 0.15; // meters
+const PMT_RADIUS = 0.127; // meters
 
 // --- Scene Setup ---
 let scene, camera, renderer, controls;
 let cylinder, pmtMeshes = [], photonPoints, muonTrackLine, pmtDivs = [];
+let pmtHitChartInstance = null; // To hold the Chart.js instance
 let photons = []; // Array to hold photon data { position, velocity, lifetime }
 let raycaster, pointer; // For click detection
-let hitPmts = new Map(); // Map<pmtIndex, { firstHitTime: number, photonCount: number }>
+let hitPmts = new Map(); // Map<pmtIndex, { hitTimes: number[], photonCount: number }>
 
 // --- Simulation State ---
 let muonPosition = new THREE.Vector3();
@@ -121,6 +122,7 @@ function init() {
     // Event Listeners
     window.addEventListener('resize', onWindowResize);
     window.addEventListener('pointerdown', onPointerDown); // Add click listener
+    updatePmtChart(undefined, null); // Initialize empty chart view
 
     // Initialize Raycaster
     raycaster = new THREE.Raycaster();
@@ -223,6 +225,13 @@ function create2dDisplay() {
             div.style.margin = '1px';
             div.style.boxSizing = 'border-box';
             div.title = `PMT Index: ${pmtIndex}`; // Tooltip for info
+
+            // Add click listener to update chart
+            div.addEventListener('click', () => {
+                const hitData = hitPmts.get(pmtIndex);
+                updatePmtChart(pmtIndex, hitData);
+            });
+
             container.appendChild(div);
             pmtDivs[pmtIndex] = div; // Store reference by index
         }
@@ -315,6 +324,14 @@ function resetSimulation() {
         }
     });
 
+    // Clear or reset the PMT hit chart
+    if (pmtHitChartInstance) {
+        pmtHitChartInstance.data.labels = [];
+        pmtHitChartInstance.data.datasets[0].data = [];
+        pmtHitChartInstance.options.plugins.title.text = 'Click a PMT to see hit times';
+        pmtHitChartInstance.update();
+    }
+
     // Reset muon track line by resetting the count and draw range
     muonTrackPointCount = 0;
     muonTrackLine.geometry.setDrawRange(0, 0);
@@ -384,14 +401,16 @@ function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation ste
         let hit = false;
         for (let j = 0; j < pmtMeshes.length; j++) {
             const pmt = pmtMeshes[j];
-            if (p.position.distanceTo(pmt.position) < PMT_RADIUS * 1.5) { // थोड़ा बड़ा त्रिज्या वाला जांच
+            if (p.position.distanceTo(pmt.position) < PMT_RADIUS * 1.6) { // Reduced hit radius multiplier
                 const hitData = hitPmts.get(j);
-                // Removed duplicate declaration of hitData
-                if (!hitData) { // First hit for this PMT
-                    const hitTime = simulationTime;
-                    hitPmts.set(j, { firstHitTime: hitTime, photonCount: 1 });
+                const currentSimTime = simulationTime; // Store current time
 
-                    // --- Calculate color immediately based on fixed scale ---
+                if (!hitData) { // First hit for this PMT
+                    // Store the first hit time in an array
+                    hitPmts.set(j, { hitTimes: [currentSimTime], photonCount: 1 });
+
+                    // --- Calculate color based on FIRST hit time ---
+                    const firstHitTime = currentSimTime; // Use current time as first hit time
                     const minTime = 10;
                     const maxTime = 200;
                     const midTime = (minTime + maxTime) / 2;
@@ -400,16 +419,16 @@ function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation ste
                     const red = new THREE.Color(0xff0000);
                     let color = new THREE.Color();
 
-                    if (hitTime <= minTime) {
+                    if (firstHitTime <= minTime) {
                         color.copy(blue);
-                    } else if (hitTime >= maxTime) {
+                    } else if (firstHitTime >= maxTime) {
                         color.copy(red);
                     } else {
-                        if (hitTime <= midTime) { // Blue to Yellow
-                            const t = (hitTime - minTime) / (midTime - minTime);
+                        if (firstHitTime <= midTime) { // Blue to Yellow
+                            const t = (firstHitTime - minTime) / (midTime - minTime);
                             color.lerpColors(blue, yellow, t);
                         } else { // Yellow to Red
-                            const t = (hitTime - midTime) / (maxTime - midTime);
+                            const t = (firstHitTime - midTime) / (maxTime - midTime);
                             color.lerpColors(yellow, red, t);
                         }
                     }
@@ -423,15 +442,16 @@ function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation ste
                         pmt.material.opacity = 1;
                         pmt.material.transparent = false;
                         pmt.material.needsUpdate = true;
-
-                        // Update 2D display
-                        if (pmtDivs[j]) {
-                            pmtDivs[j].style.backgroundColor = color.getStyle(); // Use the calculated color
-                        }
                     }
+                     // Update 2D display
+                     if (pmtDivs[j]) {
+                        pmtDivs[j].style.backgroundColor = color.getStyle(); // Use the calculated color
+                    }
+
                 } else { // Subsequent hit for this PMT
+                    hitData.hitTimes.push(currentSimTime); // Add current time to the list
                     hitData.photonCount += 1;
-                    hitPmts.set(j, hitData); // Update map entry
+                    // No need to call hitPmts.set(j, hitData) as the object reference is updated directly
                 }
                 hit = true;
                 break; // Photon is absorbed by the PMT
@@ -528,9 +548,12 @@ function onPointerDown( event ) {
         if (pmtIndex !== undefined) {
             const hitData = hitPmts.get(pmtIndex);
             if (hitData) {
-                console.log(`PMT Index: ${pmtIndex}, First Hit Time: ${hitData.firstHitTime}, Photons Collected: ${hitData.photonCount}`);
+                // Log all hit times (Removed console log)
+                // console.log(`PMT Index: ${pmtIndex}, Photons Collected: ${hitData.photonCount}, Hit Times: [${hitData.hitTimes.join(', ')}]`);
+                updatePmtChart(pmtIndex, hitData); // Update the chart
             } else {
-                console.log(`PMT Index: ${pmtIndex} was not hit.`);
+                // console.log(`PMT Index: ${pmtIndex} was not hit.`); // Removed console log
+                updatePmtChart(pmtIndex, null); // Clear chart or show 'not hit'
             }
         }
 	}
@@ -572,4 +595,101 @@ function animate() {
 
 
     renderer.render(scene, camera);
+}
+
+function updatePmtChart(pmtIndex, hitData) {
+    const ctx = document.getElementById('pmtHitChart').getContext('2d');
+    if (!ctx) return;
+
+    let labels = [];
+    let data = [];
+    let chartTitle = `PMT ${pmtIndex} Hit Times`;
+
+    if (hitData && hitData.hitTimes && hitData.hitTimes.length > 0) {
+        // Bin the data (e.g., into 2 ns bins)
+        const binSize = 1; // Nanoseconds per bin
+        const timeCounts = {};
+        let maxTime = 0;
+
+        hitData.hitTimes.forEach(time => {
+            const bin = Math.floor(time / binSize) * binSize;
+            timeCounts[bin] = (timeCounts[bin] || 0) + 1;
+            if (time > maxTime) maxTime = time;
+        });
+
+        // Prepare chart data
+        const sortedBins = Object.keys(timeCounts).map(Number).sort((a, b) => a - b);
+        const firstBin = sortedBins[0] || 0;
+        const lastBin = Math.ceil(maxTime / binSize) * binSize;
+
+        for (let binStart = firstBin; binStart <= lastBin; binStart += binSize) {
+            labels.push(`${binStart}`); // Use only the start time for the label
+            data.push(timeCounts[binStart] || 0);
+        }
+         chartTitle = `PMT #${pmtIndex} Hits (${hitData.photonCount} total)`;
+
+    } else {
+        // Ensure empty data for default/no-hit state but keep structure
+        labels = []; // Provide empty labels
+        data = [];   // Provide empty data
+        if (pmtIndex !== undefined) {
+            chartTitle = `PMT ${pmtIndex} - No Hits Recorded`;
+        } else {
+            chartTitle = 'Click a PMT to see hit times';
+        }
+    }
+
+
+    if (!pmtHitChartInstance) {
+        // Create new chart
+        pmtHitChartInstance = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [{
+                    label: 'Photons per ns', // Update label slightly
+                    data: data,
+                    backgroundColor: 'rgba(0, 123, 255, 0.7)', // Slightly less transparent
+                    barPercentage: 1.0, // Remove gap between bars
+                    categoryPercentage: 1.0, // Remove gap between categories (bins)
+                    borderColor: 'rgba(0, 123, 255, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: {
+                            display: true,
+                            text: 'Photon Count'
+                        }
+                    },
+                    x: {
+                         title: {
+                            display: true,
+                            text: 'Time (ns)' // Simpler axis title
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    title: {
+                        display: true,
+                        text: chartTitle
+                    }
+                }
+            }
+        });
+    } else {
+        // Update existing chart
+        pmtHitChartInstance.data.labels = labels;
+        pmtHitChartInstance.data.datasets[0].data = data;
+        pmtHitChartInstance.options.plugins.title.text = chartTitle;
+        pmtHitChartInstance.update();
+    }
 }
