@@ -12,9 +12,11 @@ const CHERENKOV_COS_THETA = 1 / (MUON_BETA * REFRACTIVE_INDEX);
 const CHERENKOV_ANGLE = Math.acos(CHERENKOV_COS_THETA); // Radians
 
 const PHOTON_SPEED = (3e8 / REFRACTIVE_INDEX) * 1e-9; // m/ns (scaled for simulation time)
-const PHOTON_LIFETIME = 5000; // Simulation steps before removal if not hit
+const PHOTON_LIFETIME = 4000; // Simulation steps before removal if not hit
 const PHOTONS_PER_STEP = 100; // Number of photons to generate per simulation step
-const MUON_STEP_LENGTH = 0.1; // meters per simulation step
+const MUON_STEP_LENGTH = 0.01; // meters per simulation step
+const MAX_VISIBLE_PHOTONS = 100000; // Maximum photons to buffer/draw at once
+const MAX_TRACK_POINTS = 5000; // Max points for the muon track line buffer
 
 const PMT_ROWS = 10;
 const PMTS_PER_ROW = 12;
@@ -23,8 +25,9 @@ const PMT_RADIUS = 0.15; // meters
 // --- Scene Setup ---
 let scene, camera, renderer, controls;
 let cylinder, pmtMeshes = [], photonPoints, muonTrackLine;
-let photons = []; // Array to hold photon data { mesh/index, velocity, lifetime }
-let hitPmts = new Map(); // Map<pmtIndex, hitTime>
+let photons = []; // Array to hold photon data { position, velocity, lifetime }
+let raycaster, pointer; // For click detection
+let hitPmts = new Map(); // Map<pmtIndex, { firstHitTime: number, photonCount: number }>
 
 // --- Simulation State ---
 let muonPosition = new THREE.Vector3();
@@ -33,14 +36,15 @@ let isSimulating = false;
 let simulationTime = 0;
 let detectorRadius, detectorHeight;
 let simulationStepAccumulator = 0; // Accumulator for fractional steps
-let maxSimulationTime = 0; // To store the time the simulation ends
+let muonTrackPointCount = 0; // Keep track of points added to the track buffer
+// maxSimulationTime is no longer needed
 // --- GUI ---
 let gui;
 const simParams = {
     angleTheta: 0, // degrees (Down=0)
     anglePhi: 0,   // degrees (Azimuth)
     runSimulation: startSimulation, // Link button to function
-    simulationSpeed: 0.5 // Steps per animation frame
+    simulationSpeed: 1.0 // Steps per animation frame
 };
 
 init();
@@ -78,7 +82,15 @@ function init() {
     createPmts();
 
     // Photon Geometry (using Points for efficiency)
+    // Photon Geometry (using Points for efficiency)
     const photonGeometry = new THREE.BufferGeometry();
+    // Pre-allocate buffer
+    const positions = new Float32Array(MAX_VISIBLE_PHOTONS * 3);
+    const positionAttribute = new THREE.BufferAttribute(positions, 3);
+    positionAttribute.setUsage(THREE.DynamicDrawUsage); // Hint for optimization
+    photonGeometry.setAttribute('position', positionAttribute);
+    photonGeometry.setDrawRange(0, 0); // Initially draw nothing
+
     const photonMaterial = new THREE.PointsMaterial({
         color: 0x00FFFF, // Cyan color for Cherenkov light
         size: 0.05,
@@ -92,7 +104,13 @@ function init() {
 
     // Muon Track Line
     const trackMaterial = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 2 }); // Red track
-    const trackGeometry = new THREE.BufferGeometry(); // Will be updated dynamically
+    const trackGeometry = new THREE.BufferGeometry();
+    // Pre-allocate buffer
+    const trackPositions = new Float32Array(MAX_TRACK_POINTS * 3);
+    const trackPositionAttribute = new THREE.BufferAttribute(trackPositions, 3);
+    trackPositionAttribute.setUsage(THREE.DynamicDrawUsage);
+    trackGeometry.setAttribute('position', trackPositionAttribute);
+    trackGeometry.setDrawRange(0, 0); // Initially draw nothing
     muonTrackLine = new THREE.Line(trackGeometry, trackMaterial);
     scene.add(muonTrackLine);
 
@@ -101,6 +119,11 @@ function init() {
 
     // Event Listeners
     window.addEventListener('resize', onWindowResize);
+    window.addEventListener('pointerdown', onPointerDown); // Add click listener
+
+    // Initialize Raycaster
+    raycaster = new THREE.Raycaster();
+    pointer = new THREE.Vector2();
 }
 
 function calculateDetectorDimensions() {
@@ -160,6 +183,7 @@ function createPmts() {
             pmt.position.set(x, y, z);
             // Point PMT towards the center (optional, mostly visual)
             pmt.lookAt(new THREE.Vector3(0, y, 0));
+            pmt.userData.pmtIndex = pmtMeshes.length; // Store index on mesh
             scene.add(pmt);
             pmtMeshes.push(pmt);
         }
@@ -203,9 +227,16 @@ function startSimulation() {
     muonPosition.set(0, detectorHeight / 2, 0);
 
     console.log("Starting simulation with direction:", muonDirection);
-    // Initialize muon track line starting point
-    const trackPoints = [muonPosition.clone()];
-    muonTrackLine.geometry.setFromPoints(trackPoints);
+
+    // Initialize muon track line starting point in the pre-allocated buffer
+    const trackPositions = muonTrackLine.geometry.attributes.position.array;
+    trackPositions[0] = muonPosition.x;
+    trackPositions[1] = muonPosition.y;
+    trackPositions[2] = muonPosition.z;
+    muonTrackPointCount = 1; // We have one point now
+    muonTrackLine.geometry.setDrawRange(0, muonTrackPointCount);
+    muonTrackLine.geometry.attributes.position.needsUpdate = true; // Mark buffer for update
+    muonTrackLine.geometry.computeBoundingSphere(); // Update bounds
 
 }
 
@@ -214,13 +245,14 @@ function resetSimulation() {
 
     // Reset photons
     photons = [];
-    photonPoints.geometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3)); // Clear geometry
-    photonPoints.geometry.attributes.position.needsUpdate = true;
+    // Reset draw range instead of recreating geometry
+    photonPoints.geometry.setDrawRange(0, 0);
+    photonPoints.geometry.attributes.position.needsUpdate = true; // Ensure update is registered
 
 
     // Reset PMT colors
     hitPmts.clear(); // Clear the map
-    maxSimulationTime = 0; // Reset max time
+    // maxSimulationTime reset is no longer needed
     const defaultMaterial = new THREE.MeshBasicMaterial({ color: 0x444444 });
     pmtMeshes.forEach(pmt => {
         // Ensure material exists and reset color
@@ -241,13 +273,11 @@ function resetSimulation() {
         }
     });
 
-    // Clear muon track line
-    // More robustly clear the track line geometry
-    const trackGeometry = muonTrackLine.geometry;
-    trackGeometry.setAttribute('position', new THREE.Float32BufferAttribute([], 3)); // Replace attribute with empty one
-    trackGeometry.attributes.position.needsUpdate = true;
-    trackGeometry.computeBoundingSphere(); // Reset bounds
-    trackGeometry.setDrawRange(0, 0); // Explicitly tell renderer to draw zero vertices
+    // Reset muon track line by resetting the count and draw range
+    muonTrackPointCount = 0;
+    muonTrackLine.geometry.setDrawRange(0, 0);
+    muonTrackLine.geometry.attributes.position.needsUpdate = true; // Ensure update is registered
+    muonTrackLine.geometry.computeBoundingSphere(); // Reset bounds
 
     console.log("Simulation reset.");
 }
@@ -313,20 +343,48 @@ function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation ste
         for (let j = 0; j < pmtMeshes.length; j++) {
             const pmt = pmtMeshes[j];
             if (p.position.distanceTo(pmt.position) < PMT_RADIUS * 1.5) { // थोड़ा बड़ा त्रिज्या वाला जांच
-                if (!hitPmts.has(j)) { // Only trigger hit once per PMT per simulation
-                     // Record hit time and set intermediate color
-                     hitPmts.set(j, simulationTime);
-                     // Ensure material exists before setting color
-                     // Make PMT opaque and yellow on initial hit
-                     if (!pmt.material) {
-                         // Should not happen if resetSimulation works, but handle defensively
-                         pmt.material = new THREE.MeshBasicMaterial({ color: 0xFFFF00, opacity: 1, transparent: false });
-                     } else {
-                         pmt.material.color.set(0xFFFF00);
-                         pmt.material.opacity = 1; // Make opaque
-                         pmt.material.transparent = false;
-                         pmt.material.needsUpdate = true; // Important for material changes
-                     }
+                const hitData = hitPmts.get(j);
+                // Removed duplicate declaration of hitData
+                if (!hitData) { // First hit for this PMT
+                    const hitTime = simulationTime;
+                    hitPmts.set(j, { firstHitTime: hitTime, photonCount: 1 });
+
+                    // --- Calculate color immediately based on fixed scale ---
+                    const minTime = 10;
+                    const maxTime = 200;
+                    const midTime = (minTime + maxTime) / 2;
+                    const blue = new THREE.Color(0x0000ff);
+                    const yellow = new THREE.Color(0xffff00);
+                    const red = new THREE.Color(0xff0000);
+                    let color = new THREE.Color();
+
+                    if (hitTime <= minTime) {
+                        color.copy(blue);
+                    } else if (hitTime >= maxTime) {
+                        color.copy(red);
+                    } else {
+                        if (hitTime <= midTime) { // Blue to Yellow
+                            const t = (hitTime - minTime) / (midTime - minTime);
+                            color.lerpColors(blue, yellow, t);
+                        } else { // Yellow to Red
+                            const t = (hitTime - midTime) / (maxTime - midTime);
+                            color.lerpColors(yellow, red, t);
+                        }
+                    }
+                    // --- End color calculation ---
+
+                    // Apply color and make opaque
+                    if (!pmt.material) {
+                        pmt.material = new THREE.MeshBasicMaterial({ color: color, opacity: 1, transparent: false });
+                    } else {
+                        pmt.material.color.set(color);
+                        pmt.material.opacity = 1;
+                        pmt.material.transparent = false;
+                        pmt.material.needsUpdate = true;
+                    }
+                } else { // Subsequent hit for this PMT
+                    hitData.photonCount += 1;
+                    hitPmts.set(j, hitData); // Update map entry
                 }
                 hit = true;
                 break; // Photon is absorbed by the PMT
@@ -341,9 +399,19 @@ function updatePhotons(deltaTime) { // deltaTime assumed to be ~1 simulation ste
 
     photons = nextPhotons; // Update the live photon list
 
-    // Update Three.js Points geometry
-    photonPoints.geometry.setAttribute('position', new THREE.Float32BufferAttribute(currentPhotonPositions, 3));
-    photonPoints.geometry.attributes.position.needsUpdate = true;
+    // Update Three.js Points geometry buffer
+    const positionAttribute = photonPoints.geometry.attributes.position;
+    const positionArray = positionAttribute.array;
+    const numPointsToDraw = Math.min(currentPhotonPositions.length / 3, MAX_VISIBLE_PHOTONS); // Ensure we don't exceed buffer
+
+    // Copy data from temporary array to the pre-allocated buffer
+    for (let i = 0; i < numPointsToDraw * 3; i++) {
+        positionArray[i] = currentPhotonPositions[i];
+    }
+
+    // Tell Three.js how many points to draw
+    photonPoints.geometry.setDrawRange(0, numPointsToDraw);
+    positionAttribute.needsUpdate = true; // Mark buffer for update
     photonPoints.geometry.computeBoundingSphere(); // Important for visibility checks
 }
 
@@ -359,57 +427,66 @@ function updateMuon() {
                    (muonPosition.x * muonPosition.x + muonPosition.z * muonPosition.z) <= detectorRadius * detectorRadius;
 
     if (inside) {
-        // Add current position to the track line
-        const points = muonTrackLine.geometry.attributes.position.array;
-        const newPoints = new Float32Array(points.length + 3);
-        newPoints.set(points); // Copy old points
-        newPoints[points.length] = muonPosition.x;
-        newPoints[points.length + 1] = muonPosition.y;
-        newPoints[points.length + 2] = muonPosition.z;
-        const trackGeometry = muonTrackLine.geometry;
-        trackGeometry.setAttribute('position', new THREE.BufferAttribute(newPoints, 3));
-        trackGeometry.attributes.position.needsUpdate = true;
-        // Update draw range to include the new point
-        const pointCount = newPoints.length / 3;
-        trackGeometry.setDrawRange(0, pointCount);
-        muonTrackLine.geometry.computeBoundingSphere();
+        // Add current position to the track line buffer if space allows
+        if (muonTrackPointCount < MAX_TRACK_POINTS) {
+            const trackPositions = muonTrackLine.geometry.attributes.position.array;
+            const index = muonTrackPointCount * 3;
+            trackPositions[index] = muonPosition.x;
+            trackPositions[index + 1] = muonPosition.y;
+            trackPositions[index + 2] = muonPosition.z;
+            muonTrackPointCount++;
+
+            // Update draw range to include the new point
+            muonTrackLine.geometry.setDrawRange(0, muonTrackPointCount);
+            muonTrackLine.geometry.attributes.position.needsUpdate = true;
+            muonTrackLine.geometry.computeBoundingSphere(); // Update bounds
+        } else {
+            console.warn("Max track points reached. Muon track line will not extend further.");
+        }
 
 
         // Generate photons at the new position
         generateCherenkovPhotons();
     } else {
         isSimulating = false; // Stop simulation when muon exits
-        maxSimulationTime = simulationTime; // Record final time
-        console.log(`Muon exited detector at time ${maxSimulationTime}.`);
-        updatePmtColorsFinal(); // Update colors based on hit times
+        console.log(`Muon exited detector at time ${simulationTime}.`);
+        // updatePmtColorsFinal(); // No longer needed, colors updated immediately
     }
 
     if (isSimulating) { // Only increment time if still simulating
         simulationTime++;
     }
-}
+} // Closing brace for updateMuon
 
-// Function to update PMT colors based on linear hit time after simulation ends
-function updatePmtColorsFinal() {
-    if (maxSimulationTime <= 0) return; // Avoid division by zero or no hits
+// updatePmtColorsFinal function is no longer needed and has been removed.
 
-    hitPmts.forEach((hitTime, pmtIndex) => {
-        const pmt = pmtMeshes[pmtIndex];
-        if (pmt && pmt.material) {
-            // Normalize time linearly (0=start, 1=end)
-            const t = Math.min(1, Math.max(0, hitTime / maxSimulationTime));
+// --- Event Handlers ---
 
-            // Interpolate between Blue (t=0) and Yellow (t=1)
-            // R = t, G = t, B = 1 - t
-            const color = new THREE.Color().setRGB(t, t, 1 - t);
+function onPointerDown( event ) {
 
-            pmt.material.color.set(color);
-            pmt.material.opacity = 1; // Ensure it stays opaque
-            pmt.material.transparent = false;
-            pmt.material.needsUpdate = true;
+	// Calculate pointer position in normalized device coordinates (-1 to +1) for both components
+	pointer.x = ( event.clientX / window.innerWidth ) * 2 - 1;
+	pointer.y = - ( event.clientY / window.innerHeight ) * 2 + 1;
+
+    // Update the picking ray with the camera and pointer position
+	raycaster.setFromCamera( pointer, camera );
+
+	// Calculate objects intersecting the picking ray
+	const intersects = raycaster.intersectObjects( pmtMeshes ); // Only check PMTs
+
+	if ( intersects.length > 0 ) {
+        const clickedPmtMesh = intersects[0].object;
+        const pmtIndex = clickedPmtMesh.userData.pmtIndex;
+
+        if (pmtIndex !== undefined) {
+            const hitData = hitPmts.get(pmtIndex);
+            if (hitData) {
+                console.log(`PMT Index: ${pmtIndex}, First Hit Time: ${hitData.firstHitTime}, Photons Collected: ${hitData.photonCount}`);
+            } else {
+                console.log(`PMT Index: ${pmtIndex} was not hit.`);
+            }
         }
-    });
-    console.log("Updated final PMT colors based on linear hit time (Blue to Red).");
+	}
 }
 
 
